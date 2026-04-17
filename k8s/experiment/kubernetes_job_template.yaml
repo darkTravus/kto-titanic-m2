@@ -10,8 +10,16 @@ spec:
     spec:
       containers:
         - name: "kto-titanic"
-          image: "{replaced with URI of Docker image created during Project execution}"
-          command: ["{replaced with MLflow Project entry point command}"]
+          image: "quay.io/arielemmanuel/titanic/experiment"
+          command:
+            [
+              "uv", "-n", "run", "--no-sync",
+              "-m", "titanic.training.main",
+              "--input_data_path", "/data/titanic.csv",
+              "--n_estimators", "100",
+              "--max_depth", "10",
+              "--random_state", "42"
+            ]
           resources:
             limits:
               cpu: 600m
