@@ -20,8 +20,8 @@ on:
 
 env:
   EXPERIMENT_NAME: kto-titanic
-  EXPERIMENT_IMAGE_NAME: quay.io/darktravus/titanic/experiment
-  API_IMAGE_NAME: quay.io/darktravus/titanic/api
+  EXPERIMENT_IMAGE_NAME: quay.io/arielemmanuel/titanic/experiment
+  API_IMAGE_NAME: quay.io/arielemmanuel/titanic/api
   API_ROUTE_NAME: titanic-api
   DAILYCLEAN_ROUTE_NAME: dailyclean
   MINIO_API_ROUTE_NAME: minio-api
@@ -32,26 +32,149 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+
       - name: Set up Python 3.13
         uses: actions/setup-python@v3
         with:
           python-version: 3.13
+
+      - name: Install kubectl
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl
+          curl -fsSL -o kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          kubectl version --client=true
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install uv
           uv sync --group training --group dev
+
       - name: Launch unit tests
         run: |
           uv run pytest tests/ci tests/training
-          
-          # TODO: Saisir la suite de cette pipeline. Devrait apparaître : 
-          # Install depencies, Launch unit tests, Resync only training group,
-          # Configure docker and kubectl, Get Routes from Kubernetes and add them to env
-          # Wake up dailyclean and mlflow, Build training image, Launch mlflow training in Openshift.
-          # Une fois l'API développée, et sécurisée intégrer : 
-          # Download model artifact, Build and push api image, Configure API manifest with OAuth2 domain
-          # Deploy api to Openshift with OAuth2 protection, Get OAuth2 token for integration test
-          # Test api with OAuth2 authentication, Asleep kto-mlflow with dailyclean
-          
-          
+
+      - name: Resync only training group
+        run: |
+          uv sync --group training
+
+      - name: Configure docker and kubeconfig for OpenShift
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Logging into Quay..."
+          docker login -u="${{ vars.QUAY_ROBOT_USERNAME }}" -p="${{ secrets.QUAY_ROBOT_TOKEN }}" quay.io
+
+          echo "Preparing kubeconfig..."
+          mkdir -p "$HOME/.kube"
+          KUBECONFIG_FILE="$HOME/.kube/config"
+
+          # Clean any existing config to avoid "invalid contexts list" issues
+          rm -f "$KUBECONFIG_FILE"
+
+          # Cluster
+          kubectl config --kubeconfig="$KUBECONFIG_FILE" set-cluster openshift-cluster \
+            --server="${{ vars.OPENSHIFT_SERVER }}" \
+            --insecure-skip-tls-verify=true
+
+          # Credentials
+          kubectl config --kubeconfig="$KUBECONFIG_FILE" set-credentials openshift-credentials \
+            --token="${{ secrets.OPENSHIFT_TOKEN }}"
+
+          # Namespace (adapt if your project name differs)
+          NAMESPACE="${{ vars.OPENSHIFT_USERNAME }}-dev"
+
+          # IMPORTANT: context name MUST match what MLflow is trying to load from backend-config.
+          # Your failing context was:
+          # arielemmanuel-dev/api-rm2-thpm-p1-openshiftapps-com:6443/arielemmanuel
+          # We create that exact name here so mlflow can find it.
+          MLFLOW_KUBE_CONTEXT="arielemmanuel-dev/api-rm2-thpm-p1-openshiftapps-com:6443/arielemmanuel"
+
+          kubectl config --kubeconfig="$KUBECONFIG_FILE" set-context "$MLFLOW_KUBE_CONTEXT" \
+            --cluster=openshift-cluster \
+            --user=openshift-credentials \
+            --namespace="$NAMESPACE"
+
+          kubectl config --kubeconfig="$KUBECONFIG_FILE" use-context "$MLFLOW_KUBE_CONTEXT"
+
+          echo "Current kubectl context:"
+          kubectl config current-context
+
+          echo "Smoke test: can we talk to the cluster?"
+          kubectl get ns "$NAMESPACE"
+
+      - name: Get Routes from OpenShift and add them to env
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DAILYCLEAN_ROUTE_HOST=$(kubectl get route "${{ env.DAILYCLEAN_ROUTE_NAME }}" -o jsonpath='{.spec.host}')
+          MINIO_API_ROUTE_HOST=$(kubectl get route "${{ env.MINIO_API_ROUTE_NAME }}" -o jsonpath='{.spec.host}')
+          MLFLOW_TRACKING_ROUTE_HOST=$(kubectl get route "${{ env.MLFLOW_TRACKING_ROUTE_NAME }}" -o jsonpath='{.spec.host}')
+
+          echo "DAILYCLEAN_ROUTE_URL=https://${DAILYCLEAN_ROUTE_HOST}" >> "$GITHUB_ENV"
+          echo "MINIO_API_ROUTE_URL=https://${MINIO_API_ROUTE_HOST}" >> "$GITHUB_ENV"
+          echo "MLFLOW_TRACKING_ROUTE_URL=https://${MLFLOW_TRACKING_ROUTE_HOST}" >> "$GITHUB_ENV"
+
+      - name: Wake up dailyclean and mlflow
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Ensure dailyclean is up (adapt deployment name if needed)
+          kubectl scale --replicas=1 deployment/dailyclean-api
+
+          # Give it time to start
+          sleep 30
+
+          echo "Calling dailyclean to start pods..."
+          curl -fsSL -X POST "$DAILYCLEAN_ROUTE_URL/pods/start"
+
+      - name: Build training image
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -f k8s/experiment/Dockerfile \
+            -t "${{ env.EXPERIMENT_IMAGE_NAME }}:latest" \
+            --build-arg MLFLOW_S3_ENDPOINT_URL="$MINIO_API_ROUTE_URL" \
+            --build-arg AWS_ACCESS_KEY_ID="${{ vars.AWS_ACCESS_KEY_ID }}" \
+            --build-arg AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            .
+
+          docker push "${{ env.EXPERIMENT_IMAGE_NAME }}:latest"
+
+      - name: Launch mlflow training in OpenShift (Kubernetes backend)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "MLFLOW_TRACKING_ROUTE_URL=$MLFLOW_TRACKING_ROUTE_URL"
+          echo "MINIO_API_ROUTE_URL=$MINIO_API_ROUTE_URL"
+
+          # MLflow env
+          export KUBE_MLFLOW_TRACKING_URI="$MLFLOW_TRACKING_ROUTE_URL"
+          export MLFLOW_TRACKING_URI="$MLFLOW_TRACKING_ROUTE_URL"
+          export MLFLOW_S3_ENDPOINT_URL="$MINIO_API_ROUTE_URL"
+          export AWS_ACCESS_KEY_ID="${{ vars.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+
+          # Run MLflow Project on Kubernetes/OpenShift
+          uv run mlflow run ./src/titanic/training \
+            -P path=all_titanic.csv \
+            --experiment-name "${{ env.EXPERIMENT_NAME }}" \
+            --backend kubernetes \
+            --backend-config ./k8s/experiment/kubernetes_config.json
+
+      - name: Asleep kto-mlflow with dailyclean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -X POST "$DAILYCLEAN_ROUTE_URL/pods/stop"
